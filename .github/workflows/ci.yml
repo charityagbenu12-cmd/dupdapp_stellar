@@ -79,3 +79,15 @@ jobs:
           name: wasm-contracts
           path: dabdub_contracts/target/wasm32v1-none/release/*.wasm
           retention-days: 30
+
+      # Regenerates the machine-readable ABI JSON under docs/abi/ from the
+      # built wasm and fails when the committed files drift from the contract
+      # source. Keeps the NestJS backend's ABI docs in sync with the Rust code.
+      - name: Verify contract ABI docs are up to date
+        run: |
+          make generate-abi
+          if ! git diff --quiet -- docs/abi; then
+            echo "::error::docs/abi is out of date. Run 'make generate-abi' and commit the result."
+            git diff -- docs/abi
+            exit 1
+          fi

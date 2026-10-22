@@ -72,6 +72,7 @@ Grafana/Loki/Promtail configs under [`grafana/`](grafana/) and [`docker-compose.
 
 ## Docs
 
+- [Contract ABIs (JSON)](docs/abi/) — machine-readable call signatures for each contract
 - [Escrow upgrade procedure](docs/escrow_upgrade_procedure.md)
 - [Security docs](docs/security/)
 
