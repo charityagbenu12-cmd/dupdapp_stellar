@@ -26,6 +26,8 @@ pub enum DataKey {
     ApprovedPools,
     // Issue #1085: Admin-configurable AMM depth threshold in basis points
     DepthThresholdBps,
+    // Issue #1223: Address of the slippage_protection contract
+    SlippageProtection,
 }
 
 #[contracttype]
@@ -55,6 +57,19 @@ pub trait AmmInterface {
     fn get_reserves(env: Env) -> (i128, i128);
 }
 
+// Issue #1223: Client for the slippage_protection contract. The router calls
+// `check_slippage` before executing any USDC->fiat conversion so that a swap
+// breaching the merchant's configured bounds is rejected.
+#[soroban_sdk::contractclient(name = "SlippageProtectionClient")]
+pub trait SlippageProtectionInterface {
+    fn check_slippage(
+        env: Env,
+        merchant: Address,
+        expected_amount: i128,
+        actual_amount: i128,
+    ) -> bool;
+}
+
 #[contract]
 pub struct LiquidityRouter;
 
@@ -76,6 +91,19 @@ impl LiquidityRouter {
         env.storage().instance().set(&DataKey::ApprovedPools, &pools);
         // Issue #1085: Seed the depth threshold with the previous hardcoded default
         env.storage().instance().set(&DataKey::DepthThresholdBps, &DEFAULT_DEPTH_THRESHOLD_BPS);
+    }
+
+    // Issue #1223: Admin-gated setter for the slippage_protection contract address.
+    pub fn set_slippage_protection(env: Env, admin: Address, slippage_protection: Address) {
+        admin.require_auth();
+
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .expect("admin not set");
+        if admin != stored_admin {
+            panic!("only admin can set slippage protection");
+        }
+
+        env.storage().instance().set(&DataKey::SlippageProtection, &slippage_protection);
     }
 
     // Issue #1025: Add pool to allowlist (admin-gated)
@@ -162,6 +190,36 @@ impl LiquidityRouter {
         env.storage().instance().set(&DataKey::DepthThresholdBps, &threshold_bps);
     }
 
+    /// Issue #1223: Executes a USDC->fiat swap for a merchant, enforcing the
+    /// merchant's slippage bounds via the slippage_protection contract before
+    /// the conversion is considered successful. Panics (rejecting the swap)
+    /// when the actual amount breaches the configured bounds.
+    pub fn swap_usdc_to_fiat(
+        env: Env,
+        merchant: Address,
+        expected_amount: i128,
+        actual_amount: i128,
+    ) -> bool {
+        if expected_amount <= 0 || actual_amount <= 0 {
+            panic!("invalid swap amount");
+        }
+
+        let slippage_protection: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SlippageProtection)
+            .expect("slippage protection not set");
+
+        // Issue #1223: Enforce slippage bounds before executing the swap.
+        let client = SlippageProtectionClient::new(&env, &slippage_protection);
+        let within_bounds = client.check_slippage(&merchant, &expected_amount, &actual_amount);
+        if !within_bounds {
+            panic!("slippage bounds breached");
+        }
+
+        true
+    }
+
     /// Checks if the AMM pool has sufficient depth for a swap.
     /// Returns SorobanAMM if depth is sufficient (impact below the configured
     /// threshold), otherwise returns StellarClassicDEX and emits an event.
@@ -216,14 +274,17 @@ impl LiquidityRouter {
 
         // Issue #1085: Depth check against the admin-configurable threshold.
         // amount_in must be less than threshold_bps of reserves: S < R * bps / 10000
-        let threshold_bps: u32 = env.storage().instance()
-            .get(&DataKey::DepthThresholdBps)
+        let threshold_bps: u32 = env.storage().instance().get(&DataKey::DepthThresholdBps)
             .unwrap_or(DEFAULT_DEPTH_THRESHOLD_BPS);
 
-        if amount_in < reserve_a * (threshold_bps as i128) / 10_000 {
+        let max_amount = reserve_a
+            .checked_mul(threshold_bps as i128)
+            .expect("overflow")
+            / 10_000;
+
+        if amount_in < max_amount {
             Route::SorobanAMM
         } else {
-            // Emit FallbackRouteUsed event
             env.events().publish(
                 (Symbol::new(&env, "FallbackRouteUsed"),),
                 FallbackRouteUsed {

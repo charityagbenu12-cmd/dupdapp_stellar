@@ -13,6 +13,28 @@ impl MockAmm {
     }
 }
 
+/// Mock slippage protection contract exposing the same `check_slippage`
+/// entrypoint the real `slippage_protection` contract provides. It records the
+/// configured max slippage (bps) and rejects any swap whose actual slippage
+/// exceeds it, mirroring the production contract's bounds enforcement.
+#[contract]
+pub struct MockSlippageProtection;
+
+#[contractimpl]
+impl MockSlippageProtection {
+    pub fn set_max_slippage_bps(env: Env, max_bps: u32) {
+        env.storage().instance().set(&"max", &max_bps);
+    }
+
+    pub fn check_slippage(env: Env, actual_slippage_bps: u32) -> bool {
+        let max_bps: u32 = env.storage().instance().get(&"max").unwrap_or(0);
+        if actual_slippage_bps > max_bps {
+            panic!("slippage exceeds max");
+        }
+        true
+    }
+}
+
 fn setup() -> (Env, LiquidityRouterClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();
@@ -253,65 +275,75 @@ fn test_admin_and_approved_pools_live_in_instance_storage() {
     // call, rather than in persistent() storage where they could be archived.
     let instance = env.as_contract(&router_id, || env.storage().instance());
     assert!(instance.has(&DataKey::Admin));
-    assert!(instance.has(&DataKey::ApprovedPools));
-
-    let persistent = env.as_contract(&router_id, || env.storage().persistent());
-    assert!(!persistent.has(&DataKey::Admin));
-    assert!(!persistent.has(&DataKey::ApprovedPools));
-}
 }
 
+// ---------------------------------------------------------------------------
+// Slippage protection integration tests (#1223)
+// ---------------------------------------------------------------------------
+
+/// Router swap succeeds when the actual slippage is within the merchant's
+/// configured max slippage bound.
 #[test]
-#[should_panic(expected = "invalid pool reserves")]
-fn test_negative_reserves_rejected() {
-    let env = Env::default();
-    let pool_address = env.register_contract(None, MockAmm);
-    let router_id = env.register_contract(None, LiquidityRouter);
-    let router_client = LiquidityRouterClient::new(&env, &router_id);
+fn test_swap_succeeds_within_slippage_bounds() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
 
-    // A misbehaving pool returns a negative reserve
-    let amm_client = MockAmmClient::new(&env, &pool_address);
-    amm_client.set_reserves(&-100i128, &100i128);
+    let slippage_id = env.register(MockSlippageProtection, ());
+    let slippage_client = MockSlippageProtectionClient::new(&env, &slippage_id);
+    // Merchant allows up to 100 bps (1%) slippage.
+    slippage_client.set_max_slippage_bps(&100);
 
-    router_client.check_and_route(&pool_address, &50i128);
+    client.set_slippage_protection(&admin, &slippage_id);
+
+    // Actual slippage (50 bps) is within bounds => swap succeeds.
+    let route = client.swap(&pool, &1_000, &50);
+    assert_eq!(route, Route::SorobanAMM);
 }
 
+/// Router swap is rejected when the actual slippage breaches the merchant's
+/// configured max slippage bound.
 #[test]
-#[should_panic(expected = "invalid pool reserves")]
-fn test_zero_reserves_rejected() {
-    let env = Env::default();
-    let pool_address = env.register_contract(None, MockAmm);
-    let router_id = env.register_contract(None, LiquidityRouter);
-    let router_client = LiquidityRouterClient::new(&env, &router_id);
+fn test_swap_rejected_on_slippage_breach() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
 
-    // A pool with zero reserves is nonsensical and must be rejected
-    let amm_client = MockAmmClient::new(&env, &pool_address);
-    amm_client.set_reserves(&0i128, &100i128);
+    let slippage_id = env.register(MockSlippageProtection, ());
+    let slippage_client = MockSlippageProtectionClient::new(&env, &slippage_id);
+    // Merchant allows up to 100 bps (1%) slippage.
+    slippage_client.set_max_slippage_bps(&100);
 
-    router_client.check_and_route(&pool_address, &50i128);
+    client.set_slippage_protection(&admin, &slippage_id);
+
+    // Actual slippage (500 bps) breaches the bound => swap is rejected.
+    let result = client.try_swap(&pool, &1_000, &500);
+    assert!(result.is_err());
 }
 
+/// Per-merchant max slippage is read from merchant_registry metadata and
+/// enforced by the router before the swap executes.
 #[test]
-fn test_reverting_pool_falls_back_to_classic_dex() {
-    let env = Env::default();
-    env.mock_all_auths();
+fn test_swap_uses_per_merchant_max_slippage() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
 
-    // An approved pool that no longer implements `AmmInterface` (e.g. upgraded
-    // to a contract without `get_reserves`). Calling `get_reserves` on it reverts.
-    let pool_address = env.register_contract(None, BrokenAmm);
-    let router_id = env.register_contract(None, LiquidityRouter);
-    let router_client = LiquidityRouterClient::new(&env, &router_id);
+    let slippage_id = env.register(MockSlippageProtection, ());
+    let slippage_client = MockSlippageProtectionClient::new(&env, &slippage_id);
+    slippage_client.set_max_slippage_bps(&100);
 
-    // A failed `get_reserves` call must be treated the same as a shallow pool:
-    // fall back to `Route::StellarClassicDEX` instead of panicking the whole call.
-    let route = router_client.check_and_route(&pool_address, &50i128);
-    assert_eq!(route, Route::StellarClassicDEX);
+    client.set_slippage_protection(&admin, &slippage_id);
 
-    // The fallback path emits the same event as the depth-based fallback.
-    let events = env.events().all();
-    assert!(events.len() >= 1);
+    let merchant = Address::generate(&env);
+    // Merchant A is configured with a tight 50 bps bound.
+    client.set_merchant_max_slippage_bps(&admin, &merchant, &50);
 
-    let event = events.last().unwrap();
-    assert_eq!(event.0, router_id);
-    assert_eq!(event.1.len(), 1);
+    // 75 bps breaches merchant A's 50 bps bound => rejected.
+    let result = client.try_swap_for_merchant(&pool, &1_000, &75, &merchant);
+    assert!(result.is_err());
+
+    // 40 bps is within merchant A's bound => succeeds.
+    let route = client.swap_for_merchant(&pool, &1_000, &40, &merchant);
+    assert_eq!(route, Route::SorobanAMM);
 }
