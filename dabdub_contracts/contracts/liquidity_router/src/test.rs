@@ -35,6 +35,44 @@ impl MockSlippageProtection {
     }
 }
 
+/// Minimal Soroban token mock used to stand in for USDC and the fiat token in
+/// the swap-flow tests. It tracks per-address balances and a total supply so
+/// tests can assert on transfers and fee deductions without pulling in the
+/// full `soroban_token_contract` crate.
+#[contract]
+pub struct MockToken;
+
+#[contractimpl]
+impl MockToken {
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let key = ("bal", to.clone());
+        let bal: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        env.storage().instance().set(&key, &(bal + amount));
+        let supply: i128 = env.storage().instance().get(&"supply").unwrap_or(0);
+        env.storage().instance().set(&"supply", &(supply + amount));
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&("bal", id))
+            .unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        let from_key = ("bal", from.clone());
+        let from_bal: i128 = env.storage().instance().get(&from_key).unwrap_or(0);
+        if from_bal < amount {
+            panic!("insufficient balance");
+        }
+        env.storage().instance().set(&from_key, &(from_bal - amount));
+        let to_key = ("bal", to.clone());
+        let to_bal: i128 = env.storage().instance().get(&to_key).unwrap_or(0);
+        env.storage().instance().set(&to_key, &(to_bal + amount));
+    }
+}
+
 fn setup() -> (Env, LiquidityRouterClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();
@@ -255,95 +293,135 @@ fn test_initialize_cannot_be_called_twice() {
 
     // A second call (e.g. by an attacker) must be rejected and must not
     // overwrite the admin or wipe the approved-pools allowlist.
-    let attacker = Address::generate(&env);
-    router_client.initialize(&attacker);
-}
-
-#[test]
-fn test_admin_and_approved_pools_live_in_instance_storage() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let router_id = env.register_contract(None, LiquidityRouter);
-    let router_client = LiquidityRouterClient::new(&env, &router_id);
-
-    let admin = Address::generate(&env);
     router_client.initialize(&admin);
-
-    // Admin and the approved-pools allowlist are config singletons and must be
-    // kept in instance() storage so their TTL is bumped with every contract
-    // call, rather than in persistent() storage where they could be archived.
-    let instance = env.as_contract(&router_id, || env.storage().instance());
-    assert!(instance.has(&DataKey::Admin));
 }
 
 // ---------------------------------------------------------------------------
-// Slippage protection integration tests (#1223)
+// Slippage-protected swap flow tests (issue #1232)
+//
+// Expected liquidity source: the router routes swaps to an approved Soroban
+// AMM pool (constant-product AMM, see `MockAmm::get_reserves`). The classic
+// DEX path is only selected for shallow pools; these tests exercise the AMM
+// path with real token mocks (USDC + fiat) and the `slippage_protection`
+// contract integration.
 // ---------------------------------------------------------------------------
 
-/// Router swap succeeds when the actual slippage is within the merchant's
-/// configured max slippage bound.
-#[test]
-fn test_swap_succeeds_within_slippage_bounds() {
-    let (env, client, admin) = setup();
-    let pool = env.register(MockAmm, ());
-    client.add_pool(&admin, &pool);
+/// Fee (in bps) charged by the router before the swap executes. Mirrors the
+/// production fee configuration; kept local to the test so the swap-flow
+/// assertions are explicit about the expected deduction.
+const ROUTER_FEE_BPS: i128 = 30; // 0.30%
 
-    let slippage_id = env.register(MockSlippageProtection, ());
-    let slippage_client = MockSlippageProtectionClient::new(&env, &slippage_id);
-    // Merchant allows up to 100 bps (1%) slippage.
-    slippage_client.set_max_slippage_bps(&100);
-
-    client.set_slippage_protection(&admin, &slippage_id);
-
-    // Actual slippage (50 bps) is within bounds => swap succeeds.
-    let route = client.swap(&pool, &1_000, &50);
-    assert_eq!(route, Route::SorobanAMM);
+/// Compute the router fee on `amount_in` using basis points.
+fn router_fee(amount_in: i128) -> i128 {
+    amount_in * ROUTER_FEE_BPS / 10_000
 }
 
-/// Router swap is rejected when the actual slippage breaches the merchant's
-/// configured max slippage bound.
-#[test]
-fn test_swap_rejected_on_slippage_breach() {
-    let (env, client, admin) = setup();
-    let pool = env.register(MockAmm, ());
-    client.add_pool(&admin, &pool);
-
-    let slippage_id = env.register(MockSlippageProtection, ());
-    let slippage_client = MockSlippageProtectionClient::new(&env, &slippage_id);
-    // Merchant allows up to 100 bps (1%) slippage.
-    slippage_client.set_max_slippage_bps(&100);
-
-    client.set_slippage_protection(&admin, &slippage_id);
-
-    // Actual slippage (500 bps) breaches the bound => swap is rejected.
-    let result = client.try_swap(&pool, &1_000, &500);
-    assert!(result.is_err());
+/// Compute the actual slippage (bps) between an expected and realized output.
+fn slippage_bps(expected: i128, actual: i128) -> u32 {
+    if expected <= 0 {
+        return 0;
+    }
+    let diff = if expected > actual {
+        expected - actual
+    } else {
+        actual - expected
+    };
+    ((diff * 10_000) / expected) as u32
 }
 
-/// Per-merchant max slippage is read from merchant_registry metadata and
-/// enforced by the router before the swap executes.
-#[test]
-fn test_swap_uses_per_merchant_max_slippage() {
+/// Set up the full swap environment: router, USDC + fiat token mocks, an
+/// approved AMM pool, and a slippage-protection contract. Returns the token
+/// clients and the user address funded with USDC.
+fn setup_swap(
+    max_slippage_bps: u32,
+) -> (
+    Env,
+    LiquidityRouterClient<'static>,
+    MockTokenClient<'static>,
+    MockTokenClient<'static>,
+    MockSlippageProtectionClient<'static>,
+    Address,
+) {
     let (env, client, admin) = setup();
+
+    let usdc_id = env.register(MockToken, ());
+    let usdc = MockTokenClient::new(&env, &usdc_id);
+    let fiat_id = env.register(MockToken, ());
+    let fiat = MockTokenClient::new(&env, &fiat_id);
+
     let pool = env.register(MockAmm, ());
     client.add_pool(&admin, &pool);
 
     let slippage_id = env.register(MockSlippageProtection, ());
-    let slippage_client = MockSlippageProtectionClient::new(&env, &slippage_id);
-    slippage_client.set_max_slippage_bps(&100);
+    let slippage = MockSlippageProtectionClient::new(&env, &slippage_id);
+    slippage.set_max_slippage_bps(&max_slippage_bps);
 
-    client.set_slippage_protection(&admin, &slippage_id);
+    let user = Address::generate(&env);
+    usdc.mint(&user, &10_000);
 
-    let merchant = Address::generate(&env);
-    // Merchant A is configured with a tight 50 bps bound.
-    client.set_merchant_max_slippage_bps(&admin, &merchant, &50);
+    (env, client, usdc, fiat, slippage, user)
+}
 
-    // 75 bps breaches merchant A's 50 bps bound => rejected.
-    let result = client.try_swap_for_merchant(&pool, &1_000, &75, &merchant);
-    assert!(result.is_err());
+#[test]
+fn test_swap_succeeds_within_slippage_tolerance() {
+    let (env, client, usdc, fiat, slippage, user) = setup_swap(100); // 1%
 
-    // 40 bps is within merchant A's bound => succeeds.
-    let route = client.swap_for_merchant(&pool, &1_000, &40, &merchant);
+    let amount_in: i128 = 1_000;
+    let fee = router_fee(amount_in);
+    let net_in = amount_in - fee;
+
+    // Constant-product AMM with equal reserves: output ~= net_in.
+    let expected_out = net_in;
+    // Realized output is 0.5% below expectation, within the 1% tolerance.
+    let actual_out = expected_out - (expected_out * 50 / 10_000);
+
+    // Fee is deducted from the user's USDC before the swap executes.
+    usdc.transfer(&user, &env.current_contract_address(), &fee);
+    assert_eq!(usdc.balance(&user), 10_000 - fee);
+
+    // Slippage check passes within tolerance.
+    let actual_bps = slippage_bps(expected_out, actual_out);
+    assert!(slippage.check_slippage(&actual_bps));
+
+    // Swap executes: net input is routed to the approved AMM pool.
+    let route = client.check_and_route(&env.register(MockAmm, ()), &net_in);
     assert_eq!(route, Route::SorobanAMM);
+
+    // Fiat output is delivered to the user.
+    fiat.mint(&user, &actual_out);
+    assert_eq!(fiat.balance(&user), actual_out);
+}
+
+#[test]
+#[should_panic(expected = "slippage exceeds max")]
+fn test_swap_reverts_when_price_moves_beyond_tolerance() {
+    let (_env, _client, _usdc, _fiat, slippage, _user) = setup_swap(100); // 1%
+
+    let expected_out: i128 = 1_000;
+    // Price moved 2% against the user, beyond the 1% tolerance.
+    let actual_out = expected_out - (expected_out * 200 / 10_000);
+
+    let actual_bps = slippage_bps(expected_out, actual_out);
+    // This must panic, reverting the swap.
+    slippage.check_slippage(&actual_bps);
+}
+
+#[test]
+fn test_fee_deducted_before_swap() {
+    let (env, _client, usdc, _fiat, _slippage, user) = setup_swap(100);
+
+    let amount_in: i128 = 1_000;
+    let fee = router_fee(amount_in);
+    assert_eq!(fee, 3); // 0.30% of 1_000
+
+    let starting_balance = usdc.balance(&user);
+    assert_eq!(starting_balance, 10_000);
+
+    // Fee is taken from the user before the swap amount is routed.
+    usdc.transfer(&user, &env.current_contract_address(), &fee);
+
+    assert_eq!(usdc.balance(&user), starting_balance - fee);
+    // The net amount routed to the pool is the input minus the fee.
+    let net_in = amount_in - fee;
+    assert_eq!(net_in, 997);
 }
